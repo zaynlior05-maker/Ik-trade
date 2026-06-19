@@ -86,7 +86,7 @@ class OandaFeed(DataFeed):
 class CcxtFeed(DataFeed):
     """Requires: pip install ccxt. Default exchange Binance; BTCUSD -> BTC/USDT."""
 
-    SYMBOLS = {"BTCUSD": "BTC/USDT"}
+    SYMBOLS = {"BTCUSD": "BTC/USD"}
 
     def __init__(self, exchange_id: str = "binance"):
         import ccxt
