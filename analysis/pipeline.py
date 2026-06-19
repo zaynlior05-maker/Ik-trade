@@ -34,7 +34,13 @@ class AlignmentEngine:
     def htf_bias(self) -> Bias:
         b4 = st.bias_from_structure(self.feed.get_candles(self.symbol, "4H"))
         b1 = st.bias_from_structure(self.feed.get_candles(self.symbol, "1H"))
-        return b4 if (b4 == b1 and b4 != Bias.NEUTRAL) else Bias.NEUTRAL
+        # 4H leads; 1H must agree OR be neutral. Only an actively conflicting 1H stands us down.
+        if b4 == Bias.NEUTRAL or (b1 != Bias.NEUTRAL and b1 != b4):
+            bias = Bias.NEUTRAL
+        else:
+            bias = b4
+        print(f"[{self.symbol}] HTF bias  4H={b4.value}  1H={b1.value}  ->  {bias.value}")
+        return bias
 
     # --- Setup 1: HTF POI tap + LTF MSS -------------------------------------
     def check_poi_alignment(self) -> Optional[Signal]:
@@ -119,4 +125,5 @@ class AlignmentEngine:
 
 
 def _opposite(b: Bias) -> Bias:
+    return Bias.BEARISH if b == Bias.BULLISH else Bias.BULLISH
     return Bias.BEARISH if b == Bias.BULLISH else Bias.BULLISH
