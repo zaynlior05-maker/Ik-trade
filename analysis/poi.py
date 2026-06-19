@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from models import Candle, POI, Bias
-from analysis.structure import fvg_at, fvg_centered
+from analysis.structure import fvg_at, fvg_centered, find_swings
 
 
 def _opp_color(c: Candle, direction: Bias) -> bool:
@@ -22,11 +22,26 @@ def _opp_color(c: Candle, direction: Bias) -> bool:
     return (not c.bullish) if direction == Bias.BULLISH else c.bullish
 
 
+def _swept_liquidity(prior: List[Candle], run: List[Candle], direction: Bias) -> bool:
+    """
+    Valid OB requires a liquidity TAKE-OUT: the OB run must have swept a prior
+    swing extreme before the displacement (the 'Take Out' rule).
+      bullish OB -> run low must dip below a prior swing low
+      bearish OB -> run high must push above a prior swing high
+    """
+    swings = find_swings(prior)
+    if direction == Bias.BULLISH:
+        run_low = min(c.low for c in run)
+        return any(run_low < s.price for s in swings if s.kind == "low")
+    run_high = max(c.high for c in run)
+    return any(run_high > s.price for s in swings if s.kind == "high")
+
+
 def find_order_blocks(candles: List[Candle], direction: Bias) -> List[POI]:
     out: List[POI] = []
     for i in range(2, len(candles) - 1):   # need i+1 for the adjacent FVG
         disp = candles[i]
-        # displacement candle must move in `direction` and leave an adjacent FVG
+        # displacement candle must move in `direction` and leave an adjacent FVG (the GAP)
         if direction == Bias.BULLISH and not disp.bullish:
             continue
         if direction == Bias.BEARISH and disp.bullish:
@@ -42,6 +57,10 @@ def find_order_blocks(candles: List[Candle], direction: Bias) -> List[POI]:
             run.append(candles[j])
             j -= 1
         if not run:
+            continue
+
+        # TAKE-OUT rule: the run must have swept prior liquidity
+        if not _swept_liquidity(candles[:j + 1], run, direction):
             continue
 
         top = max(c.high for c in run)        # highest wick
