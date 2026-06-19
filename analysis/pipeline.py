@@ -22,7 +22,7 @@ from analysis import poi as poi_mod
 from analysis import crt as crt_mod
 from analysis import setups as setups_mod
 
-MIN_RR = 1.5  # suppress signals whose reward:risk is below this
+MIN_RR = 1.3  # suppress signals whose reward:risk is below this
 
 
 class AlignmentEngine:
