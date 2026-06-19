@@ -20,6 +20,9 @@ from models import Signal, Bias, StructEvent
 from analysis import structure as st
 from analysis import poi as poi_mod
 from analysis import crt as crt_mod
+from analysis import setups as setups_mod
+
+MIN_RR = 1.5  # suppress signals whose reward:risk is below this
 
 
 class AlignmentEngine:
@@ -80,13 +83,27 @@ class AlignmentEngine:
             )
         return None
 
+    # --- Setup 3: Type A/B/C structured setups (LTF) ------------------------
+    def check_typed_setups(self) -> Optional[Signal]:
+        bias = self.htf_bias()
+        if bias == Bias.NEUTRAL:
+            return None
+        for tf in ("30M", "15M"):
+            ltf = self.feed.get_candles(self.symbol, tf)
+            sig = setups_mod.typed_signal(self.symbol, ltf, bias, tf)
+            if sig:
+                return sig
+        return None
+
     def evaluate(self) -> List[Signal]:
         signals = []
-        for fn in (self.check_poi_alignment, self.check_crt):
+        for fn in (self.check_poi_alignment, self.check_crt, self.check_typed_setups):
             try:
                 s = fn()
-                if s:
+                if s and (s.rr() is None or s.rr() >= MIN_RR):
                     signals.append(s)
+                elif s:
+                    print(f"[{self.symbol}] skipped {s.setup_type}: R:R {s.rr()} < {MIN_RR}")
             except Exception as e:  # never let one symbol kill the loop
                 print(f"[{self.symbol}] {fn.__name__} error: {e}")
         return signals
