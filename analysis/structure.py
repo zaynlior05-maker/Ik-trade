@@ -59,16 +59,17 @@ def fvg_at(candles: List[Candle], i: int, direction: Bias) -> Optional[Tuple[flo
     return None
 
 
-def bias_from_structure(candles: List[Candle]) -> Bias:
-    swings = find_swings(candles)
+def bias_from_structure(candles: List[Candle], lookback: int = 2) -> Bias:
+    swings = find_swings(candles, lookback)
     highs = [s for s in swings if s.kind == "high"]
     lows = [s for s in swings if s.kind == "low"]
-    if len(highs) < 2 or len(lows) < 2:
+    if len(highs) < 3 or len(lows) < 3:
         return Bias.NEUTRAL
-    hh = highs[-1].price > highs[-2].price
-    hl = lows[-1].price > lows[-2].price
-    lh = highs[-1].price < highs[-2].price
-    ll = lows[-1].price < lows[-2].price
+    # compare the latest swing to the 3rd-from-last: robust to a single pullback
+    hh = highs[-1].price > highs[-3].price
+    hl = lows[-1].price > lows[-3].price
+    lh = highs[-1].price < highs[-3].price
+    ll = lows[-1].price < lows[-3].price
     if hh and hl:
         return Bias.BULLISH
     if lh and ll:
