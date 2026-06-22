@@ -1,26 +1,31 @@
 """
-The alignment engine.
+The alignment engine — disciplined SMC/ICT signals only.
 
-Setups (POI + Type A/B/C respect the 4H/1H bias; CRT is range-based):
-  1. POI setups (4H / 1H / 15M): a valid OB/FVG in the bias direction ->
-       PENDING alert (set a limit) while price is away from it, then
-       MARKET  alert (enter now) the moment price taps it.
-  2. CRT        (4H / 3H): candle-range sweep + close back inside.
-  3. Type A/B/C (30M / 15M): the MSS -> IDM -> BOS -> POI sequence.
+Every LOWER-TIMEFRAME signal (continuation OR reversal) must show ALL FOUR:
+    Structure (MSS)  +  Liquidity (IDM sweep)  +  BOS  +  POI (OB or BB)
+
+CONTINUATION : trade WITH the 4H/1H bias (the default).
+REVERSAL     : trade AGAINST the bias, but only when "armed" — i.e. price has
+               swept the trend's own liquidity extreme (a prior swing high in an
+               uptrend / swing low in a downtrend) AND rejected it (closed back
+               inside). The counter-trend MSS is the CHoCH. At an extreme we hunt
+               reversal; otherwise continuation.
+
+CRT is the only range setup: 4H ONLY, and only when the sweep took out a real
+key level.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List
 
 from models import Signal, Bias, StructEvent
 from analysis import structure as st
-from analysis import poi as poi_mod
 from analysis import crt as crt_mod
 from analysis import setups as setups_mod
 
-MIN_RR = 1.3                       # suppress signals whose reward:risk is below this
-POI_TIMEFRAMES = ("4H", "1H", "15M")
-CRT_TIMEFRAMES = ("4H", "3H")
+MIN_RR = 1.3
+CRT_TIMEFRAMES = ("4H",)
+LTF_TIMEFRAMES = ("15M", "30M")
 
 
 def _valid_geometry(s) -> bool:
@@ -28,6 +33,35 @@ def _valid_geometry(s) -> bool:
     if s.bias == Bias.BULLISH:
         return s.stop < s.entry < s.target
     return s.stop > s.entry > s.target
+
+
+def _htf_liquidity_swept(htf, bias: Bias, window: int = 3) -> bool:
+    """
+    Reversal arming: did price sweep the trend's liquidity extreme AND reject it?
+      uptrend   -> a recent candle wicked ABOVE a prior swing high but the latest
+                   candle CLOSED back below it (failed breakout = buy-side grab).
+      downtrend -> wicked BELOW a prior swing low but CLOSED back above it.
+    """
+    swings = st.find_swings(htf)
+    if bias == Bias.BULLISH:
+        highs = [s.price for s in swings if s.kind == "high"]
+        if not highs:
+            return False
+        level = max(highs[-3:])                     # a recent swing-high liquidity pool
+        swept = any(c.high > level for c in htf[-window:])
+        rejected = htf[-1].close < level            # closed back BELOW = failed breakout
+        return swept and rejected
+    lows = [s.price for s in swings if s.kind == "low"]
+    if not lows:
+        return False
+    level = min(lows[-3:])
+    swept = any(c.low < level for c in htf[-window:])
+    rejected = htf[-1].close > level                # closed back ABOVE = failed breakdown
+    return swept and rejected
+
+
+def _opposite(b: Bias) -> Bias:
+    return Bias.BEARISH if b == Bias.BULLISH else Bias.BULLISH
 
 
 class AlignmentEngine:
@@ -46,42 +80,29 @@ class AlignmentEngine:
         print(f"[{self.symbol}] HTF bias  4H={b4.value}  1H={b1.value}  ->  {bias.value}")
         return bias
 
-    # --- Setup 1: POI pending + market (4H / 1H / 15M) -----------------------
-    def check_poi_setups(self) -> List[Signal]:
-        bias = self.htf_bias()
-        if bias == Bias.NEUTRAL:
-            return []
-        price = self.feed.get_candles(self.symbol, "15M")[-1].close
-        htf = self.feed.get_candles(self.symbol, "4H") + self.feed.get_candles(self.symbol, "1H")
+    # --- LTF continuation: Type A/B/C WITH the bias -------------------------
+    def check_typed_setups(self, bias: Bias) -> List[Signal]:
         out: List[Signal] = []
-        for tf in POI_TIMEFRAMES:
-            candles = self.feed.get_candles(self.symbol, tf)
-            pois = poi_mod.active_pois(candles, bias)
-            if bias == Bias.BULLISH:
-                pois = [p for p in pois if p.bottom <= price]
-            else:
-                pois = [p for p in pois if p.top >= price]
-            if pois:
-                out.append(self._poi_signal(pois[0], bias, price, tf, htf))
+        for tf in LTF_TIMEFRAMES:
+            ltf = self.feed.get_candles(self.symbol, tf)
+            sig = setups_mod.typed_signal(self.symbol, ltf, bias, tf)
+            if sig:
+                out.append(sig)
         return out
 
-    def _poi_signal(self, poi, bias, price, tf, htf) -> Signal:
-        if bias == Bias.BULLISH:
-            limit, stop, direction = poi.top, poi.bottom, "BUY"
-        else:
-            limit, stop, direction = poi.bottom, poi.top, "SELL"
-        target = self._next_opposing_level(htf, bias, limit)
-        if poi.contains(price):
-            entry, state = price, f"MARKET \u2014 {direction} now"
-        else:
-            entry, state = limit, f"PENDING \u2014 set {direction} LIMIT"
-        return Signal(
-            pair=self.symbol, setup_type=f"{tf} POI {poi.kind} \u2014 {state}",
-            bias=bias, entry=entry, stop=stop, target=target,
-            timeframe=tf, event=StructEvent.MSS,
-        )
+    # --- LTF reversal: Type A/B/C AGAINST the bias (armed only) --------------
+    def check_reversal_setups(self, bias: Bias) -> List[Signal]:
+        rev = _opposite(bias)
+        out: List[Signal] = []
+        for tf in LTF_TIMEFRAMES:
+            ltf = self.feed.get_candles(self.symbol, tf)
+            sig = setups_mod.typed_signal(self.symbol, ltf, rev, tf)
+            if sig:
+                sig.setup_type = "Reversal \u2014 " + sig.setup_type
+                out.append(sig)
+        return out
 
-    # --- Setup 2: CRT (4H / 3H only) ----------------------------------------
+    # --- CRT: 4H only, must sweep a key level -------------------------------
     def check_crt(self) -> List[Signal]:
         out: List[Signal] = []
         for tf in CRT_TIMEFRAMES:
@@ -90,6 +111,9 @@ class AlignmentEngine:
             if not res:
                 continue
             bias, r_low, r_high = res
+            if not crt_mod.swept_key_level(candles, bias, r_low, r_high):
+                print(f"[{self.symbol}] CRT {tf} ignored: sweep not at a key level")
+                continue
             entry = candles[-1].close
             stop = r_low if bias == Bias.BULLISH else r_high
             target = r_high if bias == Bias.BULLISH else r_low
@@ -99,44 +123,33 @@ class AlignmentEngine:
                 timeframe=tf, event=StructEvent.MSS, range_high=r_high, range_low=r_low))
         return out
 
-    # --- Setup 3: Type A/B/C (30M / 15M) ------------------------------------
-    def check_typed_setups(self) -> Optional[Signal]:
-        bias = self.htf_bias()
-        if bias == Bias.NEUTRAL:
-            return None
-        for tf in ("30M", "15M"):
-            ltf = self.feed.get_candles(self.symbol, tf)
-            sig = setups_mod.typed_signal(self.symbol, ltf, bias, tf)
-            if sig:
-                return sig
-        return None
+    def _safe(self, fn, *args) -> List[Signal]:
+        try:
+            return fn(*args)
+        except Exception as e:
+            print(f"[{self.symbol}] {fn.__name__} error: {e}")
+            return []
 
     # --- run all -------------------------------------------------------------
     def evaluate(self) -> List[Signal]:
         signals: List[Signal] = []
-        for fn in (self.check_poi_setups, self.check_crt, self.check_typed_setups):
-            try:
-                res = fn()
-                items = res if isinstance(res, list) else ([res] if res else [])
-                for s in items:
-                    if not _valid_geometry(s):
-                        print(f"[{self.symbol}] skipped {s.setup_type}: bad geometry "
-                              f"entry={s.entry} sl={s.stop} tp={s.target}")
-                        continue
-                    if s.rr() is None or s.rr() >= MIN_RR:
-                        signals.append(s)
-                    else:
-                        print(f"[{self.symbol}] skipped {s.setup_type}: R:R {s.rr()} < {MIN_RR}")
-            except Exception as e:
-                print(f"[{self.symbol}] {fn.__name__} error: {e}")
-        return signals
+        bias = self.htf_bias()
 
-    # --- helper --------------------------------------------------------------
-    def _next_opposing_level(self, htf, bias: Bias, entry: float) -> float:
-        swings = st.find_swings(htf)
-        if bias == Bias.BULLISH:
-            highs = [s.price for s in swings if s.kind == "high" and s.price > entry]
-            return min(highs) if highs else entry * 1.01
-        lows = [s.price for s in swings if s.kind == "low" and s.price < entry]
-        return max(lows) if lows else entry * 0.99
-        return max(lows) if lows else entry * 0.99
+        ltf: List[Signal] = []
+        if bias != Bias.NEUTRAL:
+            if _htf_liquidity_swept(self.feed.get_candles(self.symbol, "4H"), bias):
+                print(f"[{self.symbol}] HTF liquidity swept -> hunting REVERSAL")
+                ltf = self._safe(self.check_reversal_setups, bias)
+            else:
+                ltf = self._safe(self.check_typed_setups, bias)
+
+        for s in ltf + self._safe(self.check_crt):
+            if not _valid_geometry(s):
+                print(f"[{self.symbol}] skipped {s.setup_type}: bad geometry "
+                      f"entry={s.entry} sl={s.stop} tp={s.target}")
+                continue
+            if s.rr() is None or s.rr() >= MIN_RR:
+                signals.append(s)
+            else:
+                print(f"[{self.symbol}] skipped {s.setup_type}: R:R {s.rr()} < {MIN_RR}")
+        return signals
