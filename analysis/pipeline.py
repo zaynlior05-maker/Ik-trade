@@ -23,6 +23,13 @@ POI_TIMEFRAMES = ("4H", "1H", "15M")
 CRT_TIMEFRAMES = ("4H", "3H")
 
 
+def _valid_geometry(s) -> bool:
+    """Reject malformed signals: SL below & TP above entry for longs, opposite for shorts."""
+    if s.bias == Bias.BULLISH:
+        return s.stop < s.entry < s.target
+    return s.stop > s.entry > s.target
+
+
 class AlignmentEngine:
     def __init__(self, feed, symbol: str):
         self.feed = feed
@@ -112,6 +119,10 @@ class AlignmentEngine:
                 res = fn()
                 items = res if isinstance(res, list) else ([res] if res else [])
                 for s in items:
+                    if not _valid_geometry(s):
+                        print(f"[{self.symbol}] skipped {s.setup_type}: bad geometry "
+                              f"entry={s.entry} sl={s.stop} tp={s.target}")
+                        continue
                     if s.rr() is None or s.rr() >= MIN_RR:
                         signals.append(s)
                     else:
@@ -127,4 +138,5 @@ class AlignmentEngine:
             highs = [s.price for s in swings if s.kind == "high" and s.price > entry]
             return min(highs) if highs else entry * 1.01
         lows = [s.price for s in swings if s.kind == "low" and s.price < entry]
+        return max(lows) if lows else entry * 0.99
         return max(lows) if lows else entry * 0.99
