@@ -127,3 +127,60 @@ def price_tapped_poi(price: float, pois: List[POI]) -> Optional[POI]:
         if p.contains(price):
             return p
     return None
+
+
+def _idx_of_ts(candles: List[Candle], ts: int) -> int:
+    for i, c in enumerate(candles):
+        if c.ts == ts:
+            return i
+    return -1
+
+
+def find_breaker_blocks(candles: List[Candle], direction: Bias) -> List[POI]:
+    """
+    Breaker block = a FAILED swing whose origin is retested from the other side.
+      bearish BB: higher-high sweeps prior high (liquidity), then price CLOSES
+                  below the intervening low (structure break down). The up-candle
+                  at that high becomes resistance -> sell the retest.
+      bullish BB: lower-low sweeps prior low, then price CLOSES above the
+                  intervening high. The down-candle at that low becomes support.
+    """
+    out: List[POI] = []
+    swings = find_swings(candles)
+    highs = [x for x in swings if x.kind == "high"]
+    lows = [x for x in swings if x.kind == "low"]
+
+    if direction == Bias.BEARISH:
+        for k in range(1, len(highs)):
+            h1, h2 = highs[k - 1], highs[k]
+            if h2.price <= h1.price:                 # need a higher high (sweep)
+                continue
+            mids = [l for l in lows if h1.ts < l.ts < h2.ts]
+            if not mids:
+                continue
+            mid_low = min(mids, key=lambda l: l.price)
+            hi = _idx_of_ts(candles, h2.ts)
+            if hi < 0:
+                continue
+            if any(candles[i].close < mid_low.price for i in range(hi + 1, len(candles))):
+                z = candles[hi]                      # up-candle at the swept high
+                out.append(POI("BB", Bias.BEARISH, top=z.high, bottom=min(z.open, z.close), ts=z.ts))
+    else:
+        for k in range(1, len(lows)):
+            l1, l2 = lows[k - 1], lows[k]
+            if l2.price >= l1.price:                 # need a lower low (sweep)
+                continue
+            mids = [h for h in highs if l1.ts < h.ts < l2.ts]
+            if not mids:
+                continue
+            mid_high = max(mids, key=lambda h: h.price)
+            li = _idx_of_ts(candles, l2.ts)
+            if li < 0:
+                continue
+            if any(candles[i].close > mid_high.price for i in range(li + 1, len(candles))):
+                z = candles[li]                      # down-candle at the swept low
+                out.append(POI("BB", Bias.BULLISH, top=max(z.open, z.close), bottom=z.low, ts=z.ts))
+
+    price = candles[-1].close
+    out.sort(key=lambda pz: abs(((pz.top + pz.bottom) / 2) - price))
+    return out
