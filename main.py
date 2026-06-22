@@ -13,7 +13,7 @@ from typing import Dict
 
 from data.feeds import OandaFeed, CcxtFeed
 from analysis.pipeline import AlignmentEngine
-from alerts.telegram import send_signal
+from alerts.telegram import send_signal_with_chart
 
 FOREX = {"XAUUSD", "GBPCAD", "USDJPY"}
 CRYPTO = {"BTCUSD"}
@@ -37,8 +37,8 @@ def build_engines() -> Dict[str, AlignmentEngine]:
 
 
 def signal_key(sig) -> str:
-    # one alert per (pair, setup, bias, rounded entry) — stops duplicate spam
-    return f"{sig.pair}|{sig.setup_type}|{sig.bias.value}|{round(sig.entry, 1)}"
+    # one alert per (pair, setup, bias, rounded stop) — stops duplicate spam
+    return f"{sig.pair}|{sig.setup_type}|{sig.bias.value}|{round(sig.stop, 1)}"
 
 
 def main() -> None:
@@ -56,7 +56,8 @@ def main() -> None:
                     continue
                 seen.add(key)
                 try:
-                    send_signal(token, chat_id, sig)
+                    candles = engine.feed.get_candles(symbol, sig.timeframe)
+                    send_signal_with_chart(token, chat_id, sig, candles)
                     print(f"SENT {key}  (R:R {sig.rr()})")
                 except Exception as e:
                     seen.discard(key)  # allow retry next loop
