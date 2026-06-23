@@ -6,9 +6,10 @@ Sequences (bearish-primary, bullish mirrored):
     Type B : IDM -> MSS -> IDM -> BOS -> POI
     Type C : MSS -> IDM -> POI -> BOS
 
-POI rule (fresh / first-touch): the order/breaker block must be the CAUSE of the
-move (born in the MSS->BOS leg), still UNMITIGATED, and entered on the FIRST
-return only. A block a prior pullback already tapped is treated as stale.
+POI rule: the block must be the CAUSE of the move, price must DEPART it
+cleanly, stay UNMITIGATED, and entry is the FIRST clean return only. A zone
+price chopped inside, or an earlier pullback tapped, is stale and skipped.
+Target = nearest opposing swing (not the extreme) so R:R stays realistic.
 """
 from __future__ import annotations
 
@@ -43,7 +44,7 @@ def _find_mss(candles: List[Candle], bias: Bias) -> Optional[int]:
     if bias == Bias.BEARISH:
         lows = [s for s in swings if s.kind == "low"]
         for k in range(1, len(lows)):
-            # need a higher low (bullish micro-structure) to then break down
+            # higher low first, then a close below it = shift down
             if lows[k].price > lows[k - 1].price:
                 start = _idx_of_ts(candles, lows[k].ts) + 1
                 for i in range(start, len(candles)):
@@ -52,7 +53,7 @@ def _find_mss(candles: List[Candle], bias: Bias) -> Optional[int]:
     else:
         highs = [s for s in swings if s.kind == "high"]
         for k in range(1, len(highs)):
-            # need a lower high (bearish micro-structure) to then break up
+            # lower high first, then a close above it = shift up
             if highs[k].price < highs[k - 1].price:
                 start = _idx_of_ts(candles, highs[k].ts) + 1
                 for i in range(start, len(candles)):
@@ -80,7 +81,9 @@ def _idm_sweeps(candles: List[Candle], bias: Bias) -> List[int]:
     return sorted(out)
 
 
-def _bos_after(candles: List[Candle], bias: Bias, mss_idx: int) -> Optional[int]:
+def _bos_after(
+    candles: List[Candle], bias: Bias, mss_idx: int
+) -> Optional[int]:
     """Continuation break after the MSS leg."""
     leg = candles[mss_idx:mss_idx + 5] or candles[mss_idx:]
     if not leg:
@@ -96,6 +99,35 @@ def _bos_after(candles: List[Candle], bias: Bias, mss_idx: int) -> Optional[int]
             if candles[i].close > leg_high:
                 return i
     return None
+
+
+def _departed(candles: List[Candle], poi, start: int) -> bool:
+    """
+    True only if price cleanly left the POI after it formed (a real
+    displacement). If price just chopped inside, it never departed = stale.
+    """
+    for c in candles[start + 1:]:
+        fully_out = c.high < poi.bottom or c.low > poi.top
+        if fully_out:
+            return True
+    return False
+
+
+def _target(
+    candles: List[Candle], bias: Bias, mss_idx: int, entry: float
+) -> float:
+    """Nearest opposing swing beyond entry, else the extreme."""
+    seg = candles[mss_idx:]
+    swings = find_swings(seg)
+    if bias == Bias.BEARISH:
+        lows = [s.price for s in swings if s.kind == "low" and s.price < entry]
+        if lows:
+            return max(lows)
+        return min(c.low for c in seg)
+    highs = [s.price for s in swings if s.kind == "high" and s.price > entry]
+    if highs:
+        return min(highs)
+    return max(c.high for c in seg)
 
 
 def detect_events(candles: List[Candle], bias: Bias) -> Events:
@@ -124,14 +156,18 @@ def detect_events(candles: List[Candle], bias: Bias) -> Events:
 
     last = len(candles) - 1
     for poi in pois:
+        start = _idx_of_ts(candles, poi.ts)
+        # must displace away first; a zone price sat in is stale
+        if not _departed(candles, poi, start):
+            continue
         ft = poi_mod.first_touch_index(candles, poi)
         if ft is None:
-            # not yet returned -> fresh, pending candidate
+            # departed and not yet returned -> fresh, pending candidate
             ev.poi = poi
             ev.poi_tap_idx = None
             break
         if ft == last:
-            # first return is happening now -> fresh first-touch entry
+            # first clean return is happening now -> fresh first-touch entry
             ev.poi = poi
             ev.poi_tap_idx = ft
             break
@@ -164,16 +200,18 @@ def typed_signal(
         return None
     price = candles[-1].close
 
-    # MARKET: full structure AND price has tapped the POI -> enter now
+    # MARKET: full structure AND price is tapping the fresh POI now -> enter
     label = classify(ev)
     if label and ev.poi_tap_idx is not None:
+        # confirm price is genuinely AT the POI, not passing through
+        if not ev.poi.contains(price):
+            return None
         entry = price
         if bias == Bias.BEARISH:
             stop = ev.poi.top
-            target = min(c.low for c in candles[ev.mss_idx:])
         else:
             stop = ev.poi.bottom
-            target = max(c.high for c in candles[ev.mss_idx:])
+        target = _target(candles, bias, ev.mss_idx, entry)
         stype = f"Type {label} ({ev.poi.kind}) - MARKET enter now"
         return Signal(
             pair=symbol,
@@ -197,13 +235,12 @@ def typed_signal(
         if bias == Bias.BULLISH and ev.poi.top <= price:
             entry = ev.poi.top
             stop = ev.poi.bottom
-            target = max(c.high for c in candles[ev.mss_idx:])
         elif bias == Bias.BEARISH and ev.poi.bottom >= price:
             entry = ev.poi.bottom
             stop = ev.poi.top
-            target = min(c.low for c in candles[ev.mss_idx:])
         else:
             return None
+        target = _target(candles, bias, ev.mss_idx, entry)
         stype = f"Type {lab} ({ev.poi.kind}) - PENDING set limit"
         return Signal(
             pair=symbol,
