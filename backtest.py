@@ -1,24 +1,22 @@
 """
 Backtest harness.
 
-Replays historical candles through the SAME AlignmentEngine the live bot uses,
-then checks each signal forward to see whether TP or SL was hit first. Prints
-win rate and expectancy (in R) per symbol and setup, so you can tune the
-constants (MIN_RR, consolidation_mult, SWING_LOOKBACK, ...) on evidence.
+Replays history through the SAME AlignmentEngine the live bot uses, then checks
+each signal forward (TP vs SL first) and prints win rate + expectancy in R, per
+setup type. PENDING signals are only counted if price actually reaches the limit
+(the fill) before anything else.
 
-Two ways to run:
-  python backtest.py            # uses your live OANDA/ccxt keys to pull history
-  python backtest.py --demo     # runs on synthetic data, no keys needed (sanity)
+Run on Railway: set the Procfile worker to `python -u backtest.py`, deploy, read
+the logs, then set it back to `python -u main.py`.
 
-How it works: BacktestFeed serves only the candles that had CLOSED as of a moving
-cursor, so evaluate() sees exactly what it would have seen live at that moment.
-The cursor walks the 15M timeline; each new signal is simulated forward on 15M.
+Local:
+  python backtest.py            # uses your OANDA/ccxt keys to pull history
+  python backtest.py --demo     # synthetic data, no keys (sanity only)
 """
 from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 from models import Candle, Signal, Bias
@@ -26,32 +24,37 @@ from data.feeds import TF_SECONDS
 from analysis.pipeline import AlignmentEngine
 
 TFS = ("4H", "3H", "1H", "30M", "15M")
-WARMUP = 200          # bars of 15M history before we start evaluating
-MAX_FORWARD = 200     # 15M bars to wait for TP/SL before calling a trade "open"
+WARMUP = 200
+MAX_FORWARD = 200
 
 
 class BacktestFeed:
-    """Serves candles up to `cursor` (epoch secs). Mimics the live DataFeed API."""
+    """Serves candles up to `cursor` (epoch secs). Mimics the live feed API."""
 
     def __init__(self, history: Dict[Tuple[str, str], List[Candle]]):
         self._data = history
         self.cursor = 0
 
-    def get_candles(self, symbol: str, timeframe: str, count: int = 300) -> List[Candle]:
+    def get_candles(self, symbol, timeframe, count=300):
         full = self._data.get((symbol, timeframe), [])
         closed = [c for c in full if c.ts + TF_SECONDS[timeframe] <= self.cursor]
         return closed[-count:]
 
 
-def simulate(signal: Signal, fwd: List[Candle]) -> float | None:
-    """
-    Return realized R: +rr on TP, -1.0 on SL, None if neither within MAX_FORWARD.
-    If a single candle straddles both, assume SL first (conservative).
-    """
+def simulate(signal: Signal, fwd: List[Candle]):
+    """Realized R: +rr on TP, -1.0 on SL, None if unresolved. Models limit fill."""
     rr = signal.rr()
     if rr is None:
         return None
+    pending = "PENDING" in signal.setup_type
+    filled = not pending
     for c in fwd[:MAX_FORWARD]:
+        if not filled:
+            # limit order fills only if price trades to the entry level
+            if c.low <= signal.entry <= c.high:
+                filled = True
+            else:
+                continue
         if signal.bias == Bias.BULLISH:
             if c.low <= signal.stop:
                 return -1.0
@@ -65,7 +68,22 @@ def simulate(signal: Signal, fwd: List[Candle]) -> float | None:
     return None
 
 
-def run_symbol(symbol: str, history: Dict[Tuple[str, str], List[Candle]]) -> None:
+def _core_type(setup_type: str) -> str:
+    """Collapse 'Type A (OB) - MARKET ...' to a clean bucket for reporting."""
+    s = setup_type
+    rev = "Reversal " if s.startswith("Reversal") else ""
+    if "Type A" in s:
+        return rev + "Type A"
+    if "Type B" in s:
+        return rev + "Type B"
+    if "Type C" in s:
+        return rev + "Type C"
+    if "CRT" in s:
+        return "CRT"
+    return s
+
+
+def run_symbol(symbol, history, totals):
     feed = BacktestFeed(history)
     engine = AlignmentEngine(feed, symbol)
     base = history[(symbol, "15M")]
@@ -73,41 +91,45 @@ def run_symbol(symbol: str, history: Dict[Tuple[str, str], List[Candle]]) -> Non
     results: Dict[str, List[float]] = {}
 
     for i in range(WARMUP, len(base) - 1):
-        feed.cursor = base[i].ts + TF_SECONDS["15M"]      # close of this 15M bar
+        feed.cursor = base[i].ts + TF_SECONDS["15M"]
         for sig in engine.evaluate():
-            key = f"{sig.setup_type}|{sig.bias.value}|{round(sig.entry, 1)}"
+            key = f"{sig.setup_type}|{sig.bias.value}|{round(sig.stop, 1)}"
             if key in seen:
                 continue
             seen.add(key)
             r = simulate(sig, base[i + 1:])
             if r is None:
                 continue
-            results.setdefault(sig.setup_type, []).append(r)
+            bucket = _core_type(sig.setup_type)
+            results.setdefault(bucket, []).append(r)
+            totals.setdefault(bucket, []).append(r)
 
     _print_report(symbol, results)
 
 
-def _print_report(symbol: str, results: Dict[str, List[float]]) -> None:
-    print(f"\n===== {symbol} =====")
+def _print_report(title, results):
+    print(f"\n===== {title} =====")
     if not results:
         print("  no resolved signals in this window")
         return
-    for setup, rs in results.items():
+    for setup, rs in sorted(results.items()):
         wins = sum(1 for r in rs if r > 0)
         n = len(rs)
-        expectancy = sum(rs) / n
-        print(f"  {setup}")
-        print(f"    trades {n} | win% {100*wins/n:.0f} | "
-              f"expectancy {expectancy:+.2f}R | total {sum(rs):+.1f}R")
+        exp = sum(rs) / n
+        print(
+            f"  {setup:18} trades {n:3} | "
+            f"win% {100*wins/n:3.0f} | "
+            f"exp {exp:+.2f}R | total {sum(rs):+.1f}R"
+        )
 
 
-# --- data loading -------------------------------------------------------------
-
-def load_from_live(symbols: List[str], count: int = 1500) -> Dict[Tuple[str, str], List[Candle]]:
+def load_from_live(symbols, count=1500):
     from data.feeds import OandaFeed, CcxtFeed
     forex = {"XAUUSD", "GBPCAD", "USDJPY"}
-    oanda = OandaFeed(os.environ["OANDA_TOKEN"], os.getenv("OANDA_ENV", "practice")) \
-        if any(s in forex for s in symbols) else None
+    oanda = None
+    if any(s in forex for s in symbols):
+        oanda = OandaFeed(os.environ["OANDA_TOKEN"],
+                          os.getenv("OANDA_ENV", "practice"))
     ccxt_feed = CcxtFeed(os.getenv("CCXT_EXCHANGE", "kraken"))
     hist: Dict[Tuple[str, str], List[Candle]] = {}
     for s in symbols:
@@ -118,17 +140,16 @@ def load_from_live(symbols: List[str], count: int = 1500) -> Dict[Tuple[str, str
     return hist
 
 
-def _demo_history() -> Dict[Tuple[str, str], List[Candle]]:
+def _demo_history():
     import random
     random.seed(7)
     hist: Dict[Tuple[str, str], List[Candle]] = {}
     for tf in TFS:
         step = TF_SECONDS[tf]
-        n = 600
         candles, p, t = [], 100.0, 0
-        for _ in range(n):
+        for _ in range(600):
             o = p
-            p += random.uniform(-1, 1.05)          # slight upward drift
+            p += random.uniform(-1, 1.05)
             h = max(o, p) + random.uniform(0, 0.6)
             l = min(o, p) - random.uniform(0, 0.6)
             candles.append(Candle(ts=t, open=o, high=h, low=l, close=round(p, 2)))
@@ -137,14 +158,17 @@ def _demo_history() -> Dict[Tuple[str, str], List[Candle]]:
     return hist
 
 
-def main() -> None:
+def main():
+    totals: Dict[str, List[float]] = {}
     if "--demo" in sys.argv:
-        run_symbol("DEMO", _demo_history())
-        return
-    symbols = ["XAUUSD", "GBPCAD", "USDJPY", "BTCUSD"]
-    hist = load_from_live(symbols)
-    for s in symbols:
-        run_symbol(s, hist)
+        run_symbol("DEMO", _demo_history(), totals)
+    else:
+        symbols = ["XAUUSD", "GBPCAD", "USDJPY", "BTCUSD"]
+        hist = load_from_live(symbols)
+        for s in symbols:
+            run_symbol(s, hist)
+    _print_report("ALL SYMBOLS (combined)", totals)
+    print("\nDone. Set the Procfile worker back to: python -u main.py")
 
 
 if __name__ == "__main__":
