@@ -184,3 +184,23 @@ def find_breaker_blocks(candles: List[Candle], direction: Bias) -> List[POI]:
     price = candles[-1].close
     out.sort(key=lambda pz: abs(((pz.top + pz.bottom) / 2) - price))
     return out
+
+
+def first_touch_index(candles: List[Candle], poi: POI) -> Optional[int]:
+    """
+    Index of the FIRST candle that RETURNS to the POI zone after price has left it
+    (the first touch / first mitigation). None if price has not returned yet.
+    Used to enforce the 'fresh, unmitigated, first-touch' POI rule.
+    """
+    start = _idx_of_ts(candles, poi.ts)
+    if start < 0:
+        return None
+    left = False
+    for i in range(start + 1, len(candles)):
+        c = candles[i]
+        inside = c.low <= poi.top and c.high >= poi.bottom
+        if not inside:
+            left = True
+        elif left:
+            return i
+    return None
