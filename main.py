@@ -15,13 +15,12 @@ import os
 import time
 from typing import Dict
 
-from data.feeds import OandaFeed, CcxtFeed, DerivFeed
+from data.feeds import OandaFeed, CcxtFeed
 from analysis.pipeline import AlignmentEngine
 from alerts.telegram import send_signal_with_chart
 
 FOREX = {"XAUUSD", "GBPCAD", "USDJPY"}
 CRYPTO = {"BTCUSD"}
-DERIV = {"CRASH1000", "BOOM1000"}   # add "CRASH500","BOOM500","VOL75",... as you like
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))  # how often to poll
 
 
@@ -38,10 +37,6 @@ def build_engines() -> Dict[str, AlignmentEngine]:
         ccxt_feed = CcxtFeed(exchange_id=os.getenv("CCXT_EXCHANGE", "binance"))
         for s in CRYPTO:
             engines[s] = AlignmentEngine(ccxt_feed, s)
-    if DERIV:
-        deriv = DerivFeed(app_id=os.getenv("DERIV_APP_ID", "1089"))
-        for s in DERIV:
-            engines[s] = AlignmentEngine(deriv, s)
     return engines
 
 
