@@ -2,6 +2,10 @@
 Entry point. Routes each pair to the right feed, evaluates on a fixed cadence,
 and de-dupes so the same setup isn't re-sent on every scan.
 
+Restart-safe: on the FIRST scan after startup, any currently-valid signals are
+recorded as a silent baseline (NOT sent). Only setups that appear AFTER startup
+trigger alerts -- so a redeploy/restart never re-blasts old signals.
+
 Run:  python main.py
 Config comes from environment variables (see .env.example).
 """
@@ -11,12 +15,13 @@ import os
 import time
 from typing import Dict
 
-from data.feeds import OandaFeed, CcxtFeed
+from data.feeds import OandaFeed, CcxtFeed, DerivFeed
 from analysis.pipeline import AlignmentEngine
 from alerts.telegram import send_signal_with_chart
 
 FOREX = {"XAUUSD", "GBPCAD", "USDJPY"}
 CRYPTO = {"BTCUSD"}
+DERIV = {"CRASH1000", "BOOM1000"}   # add "CRASH500","BOOM500","VOL75",... as you like
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))  # how often to poll
 
 
@@ -33,6 +38,10 @@ def build_engines() -> Dict[str, AlignmentEngine]:
         ccxt_feed = CcxtFeed(exchange_id=os.getenv("CCXT_EXCHANGE", "binance"))
         for s in CRYPTO:
             engines[s] = AlignmentEngine(ccxt_feed, s)
+    if DERIV:
+        deriv = DerivFeed(app_id=os.getenv("DERIV_APP_ID", "1089"))
+        for s in DERIV:
+            engines[s] = AlignmentEngine(deriv, s)
     return engines
 
 
@@ -46,22 +55,32 @@ def main() -> None:
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     engines = build_engines()
     seen: set[str] = set()
+    baseline_done = False   # first scan records existing signals WITHOUT sending
 
     print(f"Bot live. Watching {list(engines)} every {SCAN_SECONDS}s.")
     while True:
+        baselined = 0
         for symbol, engine in engines.items():
             for sig in engine.evaluate():
                 key = signal_key(sig)
                 if key in seen:
                     continue
                 seen.add(key)
+                if not baseline_done:
+                    baselined += 1          # silently baseline existing setups on startup
+                    continue
                 try:
                     candles = engine.feed.get_candles(symbol, sig.timeframe)
                     send_signal_with_chart(token, chat_id, sig, candles)
                     print(f"SENT {key}  (R:R {sig.rr()})")
                 except Exception as e:
-                    seen.discard(key)  # allow retry next loop
+                    seen.discard(key)        # allow retry next loop
                     print(f"send failed for {key}: {e}")
+
+        if not baseline_done:
+            baseline_done = True
+            print(f"Startup baseline: recorded {baselined} existing signal(s), not sent. "
+                  f"Only NEW setups will alert from here.")
         time.sleep(SCAN_SECONDS)
 
 
